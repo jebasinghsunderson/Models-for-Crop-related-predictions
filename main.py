@@ -54,7 +54,10 @@ categorical_cols =['State', 'Crop', 'Season']
 
 crop_model = joblib.load("crop_model.pkl")
 crop_scaler = joblib.load("crop_scaler.pkl")
-crop_le = joblib.load("crop_label_encoder.pkl")
+crop_prediction_le = joblib.load("crop_label_encoder.pkl")
+
+print("model:", type(model))
+print("crop_model:", type(crop_model))
 
 with open("crop_features.json", "r") as f:
     crop_feature_list = json.load(f)
@@ -64,82 +67,88 @@ with open("crop_features.json", "r") as f:
 with open("fertilizer_model.pkl", "rb") as f:
     fertilizer_model = pickle.load(f)
 
+
+print("fertilizer_model:", type(fertilizer_model))
+
 with open("fertilizer_scaler.pkl", "rb") as f:
     fertilizer_scaler = pickle.load(f)
 
 soil_le = pickle.load(open("Soil_Type_encoder.pkl", "rb"))
-crop_le = pickle.load(open("Crop_Type_encoder.pkl", "rb"))
+crop_type_le = pickle.load(open("Crop_Type_encoder.pkl", "rb"))
 target_le = pickle.load(open("fertilizer_target_encoder.pkl", "rb"))
 
+print("crop_prediction_le:", type(crop_prediction_le))
+print("crop_type_le:", type(crop_type_le))
+print("soil_le:", type(soil_le))
+print("target_le:", type(target_le))
 
-# Alternatively, manually save the list from training
 @app.post("/predict")
 async def predict(data: CropInput):
     try:
-        # -----------------------------
-        # 🌾 STEP 1: Crop prediction
-        # -----------------------------
+        # ===== Crop Prediction =====
         input_df = pd.DataFrame([data.dict()])[crop_feature_list]
         input_scaled = crop_scaler.transform(input_df)
-        pred_label = crop_model.predict(input_scaled)
-        pred_crop = crop_le.inverse_transform(pred_label)
 
-        # -----------------------------
-        # 🌧️ STEP 2: Production prediction
-        # -----------------------------
+        pred_label = crop_model.predict(input_scaled)[0]
+        pred_crop = crop_prediction_le.inverse_transform([pred_label])[0]
+
+        # ===== Yield Prediction =====
         df = pd.DataFrame([data.dict()])
-        df["Crop"] = pred_crop[0]
+        df["Crop"] = pred_crop.capitalize()
         df["Annual_Rainfall"] = data.rainfall
 
-        # Clean column names
-        df.columns = df.columns.str.strip()
-
-        # Log-transform numeric features
-        log_cols = [col + "_log" for col in numeric_cols]
+        # Log transform
         for col in numeric_cols:
-            df[col + "_log"] = np.log1p(df[col])
+            df[f"{col}_log"] = np.log1p(df[col])
 
-        area = np.expm1(df["Area_log"])
+        area = float(np.expm1(df["Area_log"].iloc[0]))
 
         # Scale numeric
-        df_scaled = scaler_X.transform(df[log_cols])
-        df_scaled = pd.DataFrame(
-            df_scaled,
-            columns=[col.replace("_log", "_scaled") for col in log_cols],
-            index=df.index
+        log_cols = [f"{c}_log" for c in numeric_cols]
+        scaled = scaler_X.transform(df[log_cols])
+
+        scaled_df = pd.DataFrame(
+            scaled,
+            columns=[f"{c}_scaled" for c in numeric_cols]
         )
 
-        df = df.drop(columns=log_cols + numeric_cols)
-        df = pd.concat([df, df_scaled], axis=1)
+        df = pd.concat([df, scaled_df], axis=1)
 
         # Encode categorical
-        for col in categorical_cols:
-            df[col] = df[col].astype(str).str.strip()
+        encoded = ohe.transform(df[categorical_cols])
+        encoded_df = pd.DataFrame(
+            encoded,
+            columns=ohe.get_feature_names_out(categorical_cols)
+        )
 
-        ohe_array = ohe.transform(df[categorical_cols])
-        ohe_cols = ohe.get_feature_names_out(categorical_cols)
-        ohe_df = pd.DataFrame(ohe_array, columns=ohe_cols, index=df.index)
+        df = pd.concat([df, encoded_df], axis=1)
 
-        df = df.drop(columns=categorical_cols)
-        df = pd.concat([df, ohe_df], axis=1)
+        # Match training columns
+        df = df.reindex(
+            columns=model.feature_names_in_,
+            fill_value=0
+        )
+        
+        yield_pred = np.expm1(model.predict(df))[0]
 
-        df.columns = df.columns.str.strip()
-        model_cols = [c.strip() for c in model.feature_names_in_]
-        df = df.reindex(columns=model_cols, fill_value=0)
-        df = df.astype(np.float64)
+        # ===== Fertilizer Prediction =====
+        if pred_crop not in crop_type_le.classes_:
+            return {
+                "predicted_crop": pred_crop,
+                "prediction_scaled": round(float(yield_pred), 2),
+                "Yield": round(float(yield_pred / area), 2),
+                "warning": f"{pred_crop} not supported by fertilizer model"
+            }
+        print(crop_prediction_le.classes_)  
+        print(crop_type_le.classes_)
+        soil_encoded = soil_le.transform(
+            [data.Soil_Type.strip()]
+        )[0]
 
-        # Predict production
-        y_pred_log = model.predict(df)
-        y_pred_original = np.expm1(y_pred_log)
+        crop_encoded = crop_type_le.transform(
+            [pred_crop]
+        )[0]
 
-        # -----------------------------
-        # 🧪 STEP 3: Fertilizer prediction
-        # -----------------------------
-        # Encode categorical first
-        soil_encoded = int(soil_le.transform([data.Soil_Type.strip()])[0])
-        crop_encoded = int(crop_le.transform([pred_crop[0].strip()])[0])
-
-        # Combine numeric + encoded categorical
         num_values = np.array([
             data.temperature,
             data.humidity,
@@ -150,22 +159,65 @@ async def predict(data: CropInput):
         ]).reshape(1, -1)
 
         num_scaled = fertilizer_scaler.transform(num_values)
-        X_input = np.hstack([num_scaled, [[soil_encoded, crop_encoded]]])
 
-        fertilizer_pred_encoded = fertilizer_model.predict(X_input)[0]
-        pred_fertilizer = target_le.inverse_transform([fertilizer_pred_encoded])[0]
+        X_input = np.hstack([
+            num_scaled,
+            [[soil_encoded, crop_encoded]]
+        ])
 
-        # -----------------------------
-        # 🎯 Final output
-        # -----------------------------
+        fert_pred = fertilizer_model.predict(X_input)[0]
+        pred_fertilizer = target_le.inverse_transform(
+            [fert_pred]
+        )[0]
+
         return {
-            "predicted_crop": pred_crop[0],
+            "predicted_crop": pred_crop,
             "predicted_fertilizer": pred_fertilizer,
-            "prediction_scaled": f"{float(y_pred_original[0]):.2f}",
-            "Yield": f"{float((y_pred_original[0]) / area):.2f}"
+            "prediction_scaled": round(float(yield_pred), 2),
+            "Yield": round(float(yield_pred / area), 2)
         }
 
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+    
+
+
+
+
+
+
+    
+# Alternatively, manually save the list from training
+# @app.post("/predict")
+# async def predict(data: CropInput):
+#     input_df = pd.DataFrame([data.dict()])[crop_feature_list]
+#     input_scaled = crop_scaler.transform(input_df)
+
+#     pred_label = crop_model.predict(input_scaled)[0]
+#     pred_crop = crop_prediction_le.inverse_transform([pred_label])[0]
+
+#     df = pd.DataFrame([data.dict()])
+#     df["Crop"] = pred_crop.capitalize()
+#     df["Annual_Rainfall"] = data.rainfall
+
+#     log_cols = [col + "_log" for col in numeric_cols]
+
+#     for col in numeric_cols:
+#         df[col + "_log"] = np.log1p(df[col])
+#     df_scaled = scaler_X.transform(df[log_cols])
+#     soil_encoded = int(
+#         soil_le.transform([data.Soil_Type.strip()])[0]
+#     )
+
+#     crop_encoded = int(
+#         crop_type_le.transform([pred_crop.strip()])[0]
+#     )
+
+#     return {
+#         "soil_encoded": soil_encoded,
+#         "crop_encoded": crop_encoded
+    # }
