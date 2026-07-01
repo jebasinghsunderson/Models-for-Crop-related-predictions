@@ -135,8 +135,8 @@ async def predict(data: CropInput):
         if pred_crop not in crop_type_le.classes_:
             return {
                 "predicted_crop": pred_crop,
-                "prediction_scaled": round(float(yield_pred), 2),
-                "Yield": round(float(yield_pred / area), 2),
+                "prediction_scaled": round(float(yield_pred[0]), 2),
+                "Yield": round(float(yield_pred[0] / area), 2),
                 "warning": f"{pred_crop} not supported by fertilizer model"
             }
         print(crop_prediction_le.classes_)  
@@ -173,8 +173,8 @@ async def predict(data: CropInput):
         return {
             "predicted_crop": pred_crop,
             "predicted_fertilizer": pred_fertilizer,
-            "prediction_scaled": round(float(yield_pred), 2),
-            "Yield": round(float(yield_pred / area), 2)
+            "prediction_scaled": round(float(yield_pred[0]), 2),
+            "Yield": round(float(yield_pred[0] / area), 2)
         }
 
     except Exception as e:
